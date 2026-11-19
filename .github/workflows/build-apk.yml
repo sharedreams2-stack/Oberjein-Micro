@@ -1,0 +1,119 @@
+name: Build APK (from zip)
+
+# Extrai o zip que está na raiz do repositório e compila o APK de debug.
+# Dispara quando o zip (ou este workflow) muda na main, ou manualmente em Actions > Run workflow.
+on:
+  push:
+    branches: [main]
+    paths:
+      - '*.zip'
+      - '.github/workflows/build-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Nome do zip na raiz. Se este arquivo não existir mas houver UM único .zip na raiz, ele é usado.
+  ZIP_FILE: fx_Orbrhein-main_microcosm-dsp.zip
+
+jobs:
+  build:
+    name: Extract zip and build debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract project zip
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="$ZIP_FILE"
+          if [ ! -f "$ZIP" ]; then
+            mapfile -t zips < <(ls -1 ./*.zip 2>/dev/null || true)
+            if [ "${#zips[@]}" -ne 1 ]; then
+              echo "::error::Zip '$ZIP_FILE' not found and there is not exactly one .zip in the repository root."
+              ls -la
+              exit 1
+            fi
+            ZIP="${zips[0]}"
+          fi
+          echo "Using zip: $ZIP"
+          rm -rf extracted
+          unzip -q "$ZIP" -d extracted
+
+          # Locate the Gradle project (the folder that contains app/build.gradle.kts), wherever the zip nests it.
+          APP_GRADLE="$(find extracted -type f -path '*/app/build.gradle.kts' -not -path '*/build/*' | head -n 1)"
+          if [ -z "$APP_GRADLE" ]; then
+            echo "::error::No app/build.gradle.kts found inside $ZIP"
+            find extracted -maxdepth 4 | sort | head -100
+            exit 1
+          fi
+          PROJECT_DIR="$(dirname "$(dirname "$APP_GRADLE")")"
+          test -f "$PROJECT_DIR/settings.gradle.kts" || { echo "::error::settings.gradle.kts missing in $PROJECT_DIR"; exit 1; }
+          test -f "$PROJECT_DIR/app/src/main/cpp/fx_engine.h" || { echo "::error::fx_engine.h missing: wrong zip version?"; exit 1; }
+          echo "Project directory: $PROJECT_DIR"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "root_dir=$(dirname "$PROJECT_DIR")" >> "$GITHUB_OUTPUT"
+
+      # Fast native check of the FX engine (plain g++, no Android needed). Non-blocking on purpose for the
+      # first runs: change to 'continue-on-error: false' to make a DSP regression fail the build.
+      - name: FX engine host tests (g++)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          CPP="${{ steps.extract.outputs.project_dir }}/app/src/main/cpp"
+          T="${{ steps.extract.outputs.root_dir }}/tools/fx_host_tests"
+          if [ ! -f "$T/test2.cpp" ]; then echo "host tests not in zip, skipping"; exit 0; fi
+          g++ -std=c++17 -O2 -I"$CPP" -o /tmp/fx_test2 "$T/test2.cpp"
+          g++ -std=c++17 -O2 -I"$CPP" -o /tmp/fx_synthtest "$T/synthtest.cpp"
+          /tmp/fx_test2
+          /tmp/fx_synthtest
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install platform, build-tools, NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;26.1.10909125" "cmake;3.22.1"
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build debug APK
+        working-directory: ${{ steps.extract.outputs.project_dir }}
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Oberjein-Micro-debug-apk
+          path: ${{ steps.extract.outputs.project_dir }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build reports (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            ${{ steps.extract.outputs.project_dir }}/app/build/reports
+            ${{ steps.extract.outputs.project_dir }}/app/.cxx/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
